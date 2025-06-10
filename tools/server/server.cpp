@@ -1,5 +1,6 @@
 #include "chat.h"
 #include "utils.hpp"
+#include "llama-kv-cache-manager.h"
 
 #include "arg.h"
 #include "common.h"
@@ -1886,6 +1887,9 @@ struct server_context {
     common_chat_templates_ptr chat_templates;
     oaicompat_parser_options  oai_parser_opt;
 
+    // Context chunk manager
+    std::unique_ptr<llama_kv_cache_manager> chunk_manager;
+
     ~server_context() {
         mtmd_free(mctx);
 
@@ -2090,6 +2094,12 @@ struct server_context {
             /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
             /* enable_thinking       */ params_base.reasoning_budget != 0,
         };
+
+        // Initialize chunk manager
+        if (ctx != nullptr) {
+            std::string storage_path = params_base.slot_save_path.empty() ? "" : params_base.slot_save_path;
+            chunk_manager = std::make_unique<llama_kv_cache_manager>(ctx, storage_path);
+        }
     }
 
     server_slot * get_slot_by_id(int id) {
@@ -4100,6 +4110,146 @@ int main(int argc, char ** argv) {
         }
     };
 
+    // Context management handlers
+    const auto handle_context_get = [&ctx_server, &res_ok, &res_error](const httplib::Request &, httplib::Response & res) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        json response = ctx_server.chunk_manager->get_context_info();
+        res_ok(res, response);
+    };
+
+    const auto handle_context_post = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        try {
+            json body = json::parse(req.body);
+
+            std::string content = body.at("content");
+
+            llama_chunk_options opts;
+            if (body.contains("position")) {
+                std::string pos_str = body["position"];
+                if (pos_str == "auto") opts.position = llama_position_strategy::APPEND;
+                else if (pos_str == "best_fit") opts.position = llama_position_strategy::BEST_FIT;
+                else if (pos_str == "first_fit") opts.position = llama_position_strategy::FIRST_FIT;
+                else if (pos_str == "compact_first") opts.position = llama_position_strategy::COMPACT_FIRST;
+                else if (pos_str == "specific_pos") opts.position = llama_position_strategy::SPECIFIC_POS;
+                else if (pos_str.length() > 6 && pos_str.substr(0, 6) == "after:") {
+                    opts.position = llama_position_strategy::AFTER_CHUNK;
+                    opts.relative_to_hash = pos_str.substr(6);
+                } else if (pos_str.length() > 7 && pos_str.substr(0, 7) == "before:") {
+                    opts.position = llama_position_strategy::BEFORE_CHUNK;
+                    opts.relative_to_hash = pos_str.substr(7);
+                }
+            }
+
+            opts.preferred_position = json_value(body, "preferred_position", -1);
+            opts.tokenize = json_value(body, "tokenize", true);
+            if (!opts.tokenize && body.contains("tokens")) {
+                opts.tokens = body["tokens"].get<llama_tokens>();
+            }
+            opts.metadata = json_value(body, "metadata", json::object());
+
+            std::string hash = ctx_server.chunk_manager->add_chunk(content, opts);
+
+            if (hash.empty()) {
+                res_error(res, format_error_response("Failed to add chunk", ERROR_TYPE_SERVER));
+                return;
+            }
+
+            auto chunk_info = ctx_server.chunk_manager->get_chunk_info(hash);
+
+            // Format response to match API specification
+            json response = {
+                {"hash", hash},
+                {"size", chunk_info["size"]},
+                {"position", {
+                    {"start", chunk_info["start_pos"]},
+                    {"end", chunk_info["end_pos"]}
+                }},
+                {"status", chunk_info["status"]},
+                {"deduplication", false}
+            };
+
+            res_ok(res, response);
+        } catch (const std::exception & e) {
+            res_error(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+    };
+
+    const auto handle_context_action = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res, const std::string & hash) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        if (!llama_content_addressing::validate_hash(hash)) {
+            res_error(res, format_error_response("Invalid hash format", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string action = req.get_param_value("action");
+
+        bool success = false;
+        if (action == "save") {
+            success = ctx_server.chunk_manager->save_chunk(hash);
+        } else if (action == "restore") {
+            success = ctx_server.chunk_manager->restore_chunk(hash);
+        } else if (action == "erase") {
+            success = ctx_server.chunk_manager->erase_chunk(hash);
+        } else {
+            res_error(res, format_error_response("Invalid action. Must be: save, restore, or erase", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        if (success) {
+            res_ok(res, {{"success", true}, {"hash", hash}, {"action", action}});
+        } else {
+            res_error(res, format_error_response("Action failed", ERROR_TYPE_SERVER));
+        }
+    };
+
+    const auto handle_context_batch = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        try {
+            json body = json::parse(req.body);
+            json results = ctx_server.chunk_manager->batch_operations(body);
+            res_ok(res, results);
+        } catch (const std::exception & e) {
+            res_error(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+    };
+
+    const auto handle_context_compact = [&ctx_server, &res_ok, &res_error](const httplib::Request &, httplib::Response & res) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        ctx_server.chunk_manager->compact();
+        res_ok(res, {{"success", true}});
+    };
+
+    const auto handle_context_gc = [&ctx_server, &res_ok, &res_error](const httplib::Request &, httplib::Response & res) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        ctx_server.chunk_manager->garbage_collect();
+        res_ok(res, {{"success", true}});
+    };
+
     const auto handle_props = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
         // this endpoint is publicly available, please only return what is safe to be exposed
         json data = {
@@ -4860,6 +5010,13 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get ("/slots",               handle_slots);
     svr->Post("/slots/:id_slot",      handle_slots_action);
+    // Context management
+    svr->Get ("/context",             handle_context_get);
+    svr->Post("/context",             handle_context_post);
+    svr->Post("/context/batch",       handle_context_batch);
+    svr->Post("/context/compact",     handle_context_compact);
+    svr->Post("/context/gc",          handle_context_gc);
+    svr->Post("/context/:hash",       [&](const httplib::Request & req, httplib::Response & res) { handle_context_action(req, res, req.path_params.at("hash")); });
 
     //
     // Start the server
