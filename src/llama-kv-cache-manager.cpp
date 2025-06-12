@@ -154,8 +154,6 @@ private:
 
     // Chunk management
     std::unordered_map<std::string, llama_chunk_info> chunks;
-    std::unordered_map<llama_seq_id, std::string> seq_to_hash;
-    llama_seq_id next_seq_id = 0;
 
     // Storage
     llama_chunk_storage storage;
@@ -175,14 +173,8 @@ private:
     std::chrono::high_resolution_clock::time_point start_time;
 
     llama_seq_id allocate_seq_id() {
-        return next_seq_id++;
-    }
-
-    void free_seq_id(llama_seq_id seq_id) {
-        if (seq_id >= 0) {
-            memory->seq_rm(seq_id, 0, -1);
-            seq_to_hash.erase(seq_id);
-        }
+        // All chunks share the same sequence so cross attention works
+        return 0;
     }
 
     llama_tokens tokenize_content(const std::string & content, bool add_special) {
@@ -203,7 +195,7 @@ private:
         return tokens;
     }
 
-    bool store_tokens_in_sequence(const llama_tokens & tokens, llama_seq_id seq_id) {
+    bool store_tokens_in_sequence(const llama_tokens & tokens, llama_seq_id seq_id, llama_pos start_pos) {
         if (tokens.empty()) {
             return true;
         }
@@ -217,7 +209,7 @@ private:
         // Add tokens to batch for this sequence - implement common_batch_add inline
         for (size_t i = 0; i < tokens.size(); i++) {
             batch.token[i] = tokens[i];
-            batch.pos[i] = i;
+            batch.pos[i] = start_pos + i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = seq_id;
             batch.logits[i] = false;
@@ -294,8 +286,16 @@ public:
                              tokenize_content(content, true) :
                              opts.tokens;
 
-        // Allocate sequence ID
+        // Allocate sequence ID (shared sequence 0)
         llama_seq_id seq_id = allocate_seq_id();
+
+        // Determine placement - append at the end of the shared sequence
+        llama_pos start_pos = llama_memory_seq_pos_max(memory, seq_id);
+        if (start_pos < 0) {
+            start_pos = 0;
+        } else {
+            start_pos += 1;
+        }
 
         // Create chunk info
         llama_chunk_info chunk;
@@ -303,22 +303,20 @@ public:
         chunk.content = content;
         chunk.tokens = tokens;
         chunk.seq_id = seq_id;
-        chunk.start_pos = 0;  // Sequence handles positioning
-        chunk.end_pos = tokens.size();
+        chunk.start_pos = start_pos;
+        chunk.end_pos = start_pos + tokens.size();
         chunk.status = llama_chunk_status::LOADED;
         chunk.metadata = opts.metadata;
         chunk.created_at = std::chrono::system_clock::now();
         chunk.last_accessed = chunk.created_at;
 
         // Store in KV cache
-        if (!store_tokens_in_sequence(tokens, seq_id)) {
-            free_seq_id(seq_id);
+        if (!store_tokens_in_sequence(tokens, seq_id, start_pos)) {
             return "";
         }
 
         // Update mappings
         chunks[hash] = chunk;
-        seq_to_hash[seq_id] = hash;
 
         loaded_chunks++;
         total_chunks++;
@@ -343,7 +341,8 @@ public:
         it->second.status = llama_chunk_status::SAVED;
         it->second.save_file = storage.get_chunk_path(hash);
 
-        free_seq_id(it->second.seq_id);
+        // Remove tokens from the shared sequence
+        memory->seq_rm(it->second.seq_id, it->second.start_pos, it->second.end_pos);
         it->second.seq_id = -1;
 
         loaded_chunks--;
@@ -360,13 +359,12 @@ public:
             return false;
         }
 
-        // Allocate new sequence ID
+        // Allocate new sequence ID (shared sequence 0)
         llama_seq_id seq_id = allocate_seq_id();
         it->second.seq_id = seq_id;
 
         // Restore using proper KV cache state APIs
         if (!storage.restore_chunk_state(hash, it->second, ctx)) {
-            free_seq_id(seq_id);
             it->second.seq_id = -1;
             return false;
         }
@@ -375,8 +373,6 @@ public:
         it->second.status = llama_chunk_status::LOADED;
         it->second.last_accessed = std::chrono::system_clock::now();
         it->second.save_file.clear();
-
-        seq_to_hash[seq_id] = hash;
 
         loaded_chunks++;
         saved_chunks--;
@@ -394,7 +390,7 @@ public:
 
         // Remove from KV cache if loaded
         if (it->second.status == llama_chunk_status::LOADED) {
-            free_seq_id(it->second.seq_id);
+            memory->seq_rm(it->second.seq_id, it->second.start_pos, it->second.end_pos);
             loaded_chunks--;
         } else if (it->second.status == llama_chunk_status::SAVED) {
             saved_chunks--;
