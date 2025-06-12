@@ -41,8 +41,9 @@ def test_minimal_context_api():
                 data = response.json()
                 chunks.append(data["hash"])
                 print(f"✅ Added chunk {i}: {data['hash'][:16]}...")
-                print(f"   Size: {data['size']} tokens")
-                print(f"   Position: {data['position']['start']}-{data['position']['end']}")
+                print(f"   Size: {data['token_size']} tokens")
+                print(f"   Position: {data['position']['start']}-{data['position']['end']}" )
+                print(f"   Memory used: {data['memory_size']} tokens")
             else:
                 print(f"❌ Failed to add chunk {i}: {response.status_code}")
                 print(f"   Response: {response.text}")
@@ -75,6 +76,7 @@ def test_minimal_context_api():
             data = response.json()
             print(f"✅ Best fit positioning: {data['hash'][:16]}...")
             print(f"   Position: {data['position']['start']}-{data['position']['end']}")
+            print(f"   Memory used: {data['memory_size']} tokens")
         else:
             print(f"❌ Best fit failed: {response.status_code}")
         
@@ -90,6 +92,7 @@ def test_minimal_context_api():
                 data = response.json()
                 print(f"✅ After positioning: {data['hash'][:16]}...")
                 print(f"   Position: {data['position']['start']}-{data['position']['end']}")
+                print(f"   Memory used: {data['memory_size']} tokens")
             else:
                 print(f"❌ After positioning failed: {response.status_code}")
         

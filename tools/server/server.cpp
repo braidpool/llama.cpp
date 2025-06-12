@@ -4168,10 +4168,11 @@ int main(int argc, char ** argv) {
             // Format response to match API specification
             json response = {
                 {"hash", hash},
-                {"size", chunk_info["size"]},
+                {"token_size", chunk_info["token_size"]},
+                {"memory_size", chunk_info["memory_size"]},
                 {"position", {
-                    {"start", chunk_info["start_pos"]},
-                    {"end", chunk_info["end_pos"]}
+                    {"start", chunk_info["token_start_pos"]},
+                    {"end", chunk_info["token_end_pos"]}
                 }},
                 {"status", chunk_info["status"]},
                 {"deduplication", false}

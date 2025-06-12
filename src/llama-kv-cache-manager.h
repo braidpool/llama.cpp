@@ -57,8 +57,9 @@ struct llama_chunk_info {
     std::string content;                // Original text content
     llama_tokens tokens;                // Tokenized content
     llama_seq_id seq_id;                // Sequence ID in KV cache
-    llama_pos start_pos = -1;          // Position in KV cache
-    llama_pos end_pos = -1;            // End position in KV cache
+    llama_pos token_start_pos = -1;     // Token start position in KV cache
+    llama_pos token_end_pos = -1;       // Token end position in KV cache
+    size_t memory_size = 0;             // Actual KV cache memory used
     llama_chunk_status status = llama_chunk_status::EMPTY;
     std::string save_file;             // Disk file path
     json metadata;                     // User metadata

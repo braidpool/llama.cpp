@@ -228,9 +228,10 @@ class llama_kv_cache_manager_impl {
         json result = {
             { "hash",      chunk.hash                                                               },
             { "seq_id",    chunk.seq_id                                                             },
-            { "start_pos", chunk.start_pos                                                          },
-            { "end_pos",   chunk.end_pos                                                            },
-            { "size",      chunk.tokens.size()                                                      },
+            { "token_start_pos", chunk.token_start_pos },
+            { "token_end_pos",   chunk.token_end_pos },
+            { "token_size",      chunk.tokens.size() },
+            { "memory_size",     chunk.memory_size      },
             { "status",    chunk.status == llama_chunk_status::LOADED ? "loaded" :
                         chunk.status == llama_chunk_status::SAVED  ? "saved" :
                                                                      "empty" },
@@ -303,8 +304,9 @@ class llama_kv_cache_manager_impl {
         chunk.content       = content;
         chunk.tokens        = tokens;
         chunk.seq_id        = seq_id;
-        chunk.start_pos     = start_pos;
-        chunk.end_pos       = start_pos + tokens.size();
+        chunk.token_start_pos = start_pos;
+        chunk.token_end_pos   = start_pos + tokens.size();
+        chunk.memory_size     = tokens.size();
         chunk.status        = llama_chunk_status::LOADED;
         chunk.metadata      = opts.metadata;
         chunk.created_at    = std::chrono::system_clock::now();
@@ -342,7 +344,7 @@ class llama_kv_cache_manager_impl {
         it->second.save_file = storage.get_chunk_path(hash);
 
         // Remove tokens from the shared sequence
-        memory->seq_rm(it->second.seq_id, it->second.start_pos, it->second.end_pos);
+        memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
         it->second.seq_id = -1;
 
         loaded_chunks--;
@@ -369,6 +371,20 @@ class llama_kv_cache_manager_impl {
             return false;
         }
 
+        // Determine placement after restore
+        llama_pos start_pos = llama_memory_seq_pos_min(memory, seq_id);
+        if (start_pos < 0) {
+            start_pos = 0;
+        }
+        llama_pos end_pos = llama_memory_seq_pos_max(memory, seq_id);
+        if (end_pos < start_pos) {
+            end_pos = start_pos + it->second.tokens.size();
+        }
+
+        it->second.token_start_pos = start_pos;
+        it->second.token_end_pos   = end_pos + 1;
+        it->second.memory_size     = it->second.token_end_pos - it->second.token_start_pos;
+
         // Update status
         it->second.status        = llama_chunk_status::LOADED;
         it->second.last_accessed = std::chrono::system_clock::now();
@@ -390,7 +406,7 @@ class llama_kv_cache_manager_impl {
 
         // Remove from KV cache if loaded
         if (it->second.status == llama_chunk_status::LOADED) {
-            memory->seq_rm(it->second.seq_id, it->second.start_pos, it->second.end_pos);
+            memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
             loaded_chunks--;
         } else if (it->second.status == llama_chunk_status::SAVED) {
             saved_chunks--;
@@ -594,9 +610,10 @@ json llama_chunk_info::to_json() const {
     json result = {
         { "hash",      hash                                                           },
         { "seq_id",    seq_id                                                         },
-        { "start_pos", start_pos                                                      },
-        { "end_pos",   end_pos                                                        },
-        { "size",      tokens.size()                                                  },
+        { "token_start_pos", token_start_pos },
+        { "token_end_pos",   token_end_pos },
+        { "token_size",      tokens.size() },
+        { "memory_size",     memory_size },
         { "status",    status == llama_chunk_status::LOADED ? "loaded" :
                     status == llama_chunk_status::SAVED  ? "saved" :
                                                            "empty" },

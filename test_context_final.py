@@ -42,6 +42,7 @@ def test_context_api():
             data = response.json()
             chunks.append(data["hash"])
             print(f"✅ Auto position: {data['hash'][:12]}... at {data['position']['start']}-{data['position']['end']}")
+            print(f"   Memory used: {data['memory_size']} tokens")
         else:
             print(f"❌ Failed to add chunk: {response.status_code}")
             return False
@@ -57,6 +58,7 @@ def test_context_api():
             data = response.json()
             chunks.append(data["hash"])
             print(f"✅ Best fit: {data['hash'][:12]}... at {data['position']['start']}-{data['position']['end']}")
+            print(f"   Memory used: {data['memory_size']} tokens")
         else:
             print(f"❌ Best fit failed: {response.status_code}")
         
@@ -72,6 +74,7 @@ def test_context_api():
                 data = response.json()
                 chunks.append(data["hash"])
                 print(f"✅ After positioning: {data['hash'][:12]}... at {data['position']['start']}-{data['position']['end']}")
+                print(f"   Memory used: {data['memory_size']} tokens")
             else:
                 print(f"❌ After positioning failed: {response.status_code}")
         
@@ -164,7 +167,7 @@ def test_context_api():
             if data['chunks']:
                 print(f"   Remaining chunks:")
                 for chunk in data['chunks'][:3]:  # Show first 3
-                    print(f"     • {chunk['hash'][:12]}... ({chunk['size']} tokens, {chunk['metadata'].get('type', 'unknown')})")
+                    print(f"     • {chunk['hash'][:12]}... ({chunk['token_size']} tokens, {chunk['metadata'].get('type', 'unknown')}, memory {chunk['memory_size']})")
                 if len(data['chunks']) > 3:
                     print(f"     ... and {len(data['chunks'])-3} more")
         

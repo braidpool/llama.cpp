@@ -21,7 +21,7 @@ A chunk is a piece of content (text) that can be independently managed. Each chu
 - **Hash** - SHA256 hash of the content (64 character hex string)
 - **Content** - The original text
 - **Tokens** - Tokenized representation
-- **Position** - Location in the KV cache (start_pos, end_pos)
+- **Position** - Location in the KV cache (`token_start_pos`, `token_end_pos`)
 - **Status** - `loaded` (in memory), `saved` (on disk), or `empty`
 - **Metadata** - User-defined JSON metadata
 
@@ -51,9 +51,10 @@ Returns information about all chunks and memory usage.
   "chunks": [
     {
       "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "start_pos": 0,
-      "end_pos": 1000,
-      "size": 1000,
+      "token_start_pos": 0,
+      "token_end_pos": 1000,
+      "token_size": 1000,
+      "memory_size": 1000,
       "status": "loaded",
       "save_file": "chunk_e3b0c44298fc1c14.kv",
       "content_preview": "This is the beginning of the content...",
@@ -93,7 +94,8 @@ Request:
 Response:
 {
   "hash": "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
-  "size": 12,
+  "token_size": 12,
+  "memory_size": 12,
   "position": {"start": 1000, "end": 1012},
   "status": "loaded",
   "deduplication": false,
