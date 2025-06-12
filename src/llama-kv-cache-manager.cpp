@@ -1,26 +1,27 @@
 #include "llama-kv-cache-manager.h"
-#include "llama-context.h"
-#include "llama-vocab.h"
 
-#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <openssl/evp.h>
+#include <nlohmann/json.hpp>
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
+
+#include "llama-context.h"
+#include "llama-vocab.h"
 
 //
 // Implementation classes
 //
 
 class llama_chunk_storage {
-private:
+  private:
     std::string base_path;
 
-public:
+  public:
     explicit llama_chunk_storage(const std::string & path) : base_path(path) {
         if (!path.empty()) {
             try {
@@ -35,7 +36,7 @@ public:
         if (base_path.empty()) {
             return "";
         }
-        std::string prefix = hash.substr(0, 2);
+        std::string prefix   = hash.substr(0, 2);
         std::string filename = "chunk_" + hash + ".kv";
         return base_path + "/chunks/" + prefix + "/" + filename;
     }
@@ -45,7 +46,7 @@ public:
             return false;
         }
 
-        std::string path = get_chunk_path(hash);
+        std::string path     = get_chunk_path(hash);
         std::string dir_path = std::filesystem::path(path).parent_path();
 
         try {
@@ -55,18 +56,18 @@ public:
         }
 
         // Save metadata
-        std::string meta_path = path + ".meta";
+        std::string   meta_path = path + ".meta";
         std::ofstream meta_file(meta_path);
         if (!meta_file) {
             return false;
         }
 
         json meta_data = {
-            {"hash", hash},
-            {"content", chunk.content},
-            {"metadata", chunk.metadata},
-            {"seq_id", chunk.seq_id},
-            {"token_count", chunk.tokens.size()}
+            { "hash",        hash                },
+            { "content",     chunk.content       },
+            { "metadata",    chunk.metadata      },
+            { "seq_id",      chunk.seq_id        },
+            { "token_count", chunk.tokens.size() }
         };
 
         meta_file << meta_data.dump(4);
@@ -74,8 +75,7 @@ public:
 
         // Save KV cache state using llama.cpp APIs
         if (chunk.seq_id >= 0) {
-            return ctx->state_seq_save_file(chunk.seq_id, path.c_str(),
-                                          chunk.tokens.data(), chunk.tokens.size()) > 0;
+            return ctx->state_seq_save_file(chunk.seq_id, path.c_str(), chunk.tokens.data(), chunk.tokens.size()) > 0;
         }
 
         return true;
@@ -86,7 +86,7 @@ public:
             return false;
         }
 
-        std::string path = get_chunk_path(hash);
+        std::string path      = get_chunk_path(hash);
         std::string meta_path = path + ".meta";
 
         // Load metadata
@@ -99,20 +99,20 @@ public:
         meta_file >> meta_data;
         meta_file.close();
 
-        chunk.hash = meta_data["hash"];
-        chunk.content = meta_data["content"];
+        chunk.hash     = meta_data["hash"];
+        chunk.content  = meta_data["content"];
         chunk.metadata = meta_data["metadata"];
-        chunk.seq_id = meta_data["seq_id"];
+        chunk.seq_id   = meta_data["seq_id"];
 
         // Restore KV cache state using llama.cpp APIs
         if (std::filesystem::exists(path)) {
             llama_tokens tokens_out;
-            size_t n_token_capacity = meta_data["token_count"];
+            size_t       n_token_capacity = meta_data["token_count"];
             tokens_out.resize(n_token_capacity);
             size_t n_token_count_out = 0;
 
-            size_t result = ctx->state_seq_load_file(chunk.seq_id, path.c_str(),
-                                                   tokens_out.data(), n_token_capacity, &n_token_count_out);
+            size_t result = ctx->state_seq_load_file(chunk.seq_id, path.c_str(), tokens_out.data(), n_token_capacity,
+                                                     &n_token_count_out);
 
             if (result > 0) {
                 tokens_out.resize(n_token_count_out);
@@ -129,7 +129,7 @@ public:
             return true;
         }
 
-        std::string path = get_chunk_path(hash);
+        std::string path      = get_chunk_path(hash);
         std::string meta_path = path + ".meta";
 
         bool success = true;
@@ -145,12 +145,12 @@ public:
 };
 
 class llama_kv_cache_manager_impl {
-private:
-    llama_context * ctx;
+  private:
+    llama_context *     ctx;
     const llama_model * model;
     const llama_vocab * vocab;
-    llama_memory_t memory;
-    uint32_t n_ctx;
+    llama_memory_t      memory;
+    uint32_t            n_ctx;
 
     // Chunk management
     std::unordered_map<std::string, llama_chunk_info> chunks;
@@ -159,17 +159,17 @@ private:
     llama_chunk_storage storage;
 
     // Configuration
-    float fragmentation_threshold = 0.20f;
-    bool auto_compact_enabled = true;
-    size_t max_memory_chunks = 10;
+    float  fragmentation_threshold = 0.20f;
+    bool   auto_compact_enabled    = true;
+    size_t max_memory_chunks       = 10;
 
     // Thread safety
     mutable std::shared_mutex manager_mutex;
 
     // Performance metrics
-    std::atomic<size_t> total_chunks{0};
-    std::atomic<size_t> loaded_chunks{0};
-    std::atomic<size_t> saved_chunks{0};
+    std::atomic<size_t>                            total_chunks{ 0 };
+    std::atomic<size_t>                            loaded_chunks{ 0 };
+    std::atomic<size_t>                            saved_chunks{ 0 };
     std::chrono::high_resolution_clock::time_point start_time;
 
     llama_seq_id allocate_seq_id() {
@@ -186,7 +186,8 @@ private:
         }
 
         tokens.resize(n_tokens);
-        int actual_tokens = llama_tokenize(vocab, content.c_str(), content.length(), tokens.data(), n_tokens, add_special, false);
+        int actual_tokens =
+            llama_tokenize(vocab, content.c_str(), content.length(), tokens.data(), n_tokens, add_special, false);
         if (actual_tokens < 0) {
             actual_tokens = -actual_tokens;
         }
@@ -208,11 +209,11 @@ private:
 
         // Add tokens to batch for this sequence - implement common_batch_add inline
         for (size_t i = 0; i < tokens.size(); i++) {
-            batch.token[i] = tokens[i];
-            batch.pos[i] = start_pos + i;
-            batch.n_seq_id[i] = 1;
+            batch.token[i]     = tokens[i];
+            batch.pos[i]       = start_pos + i;
+            batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = seq_id;
-            batch.logits[i] = false;
+            batch.logits[i]    = false;
         }
         batch.n_tokens = tokens.size();
 
@@ -225,14 +226,15 @@ private:
 
     json chunk_to_json(const llama_chunk_info & chunk) const {
         json result = {
-            {"hash", chunk.hash},
-            {"seq_id", chunk.seq_id},
-            {"start_pos", chunk.start_pos},
-            {"end_pos", chunk.end_pos},
-            {"size", chunk.tokens.size()},
-            {"status", chunk.status == llama_chunk_status::LOADED ? "loaded" :
-                      chunk.status == llama_chunk_status::SAVED ? "saved" : "empty"},
-            {"metadata", chunk.metadata}
+            { "hash",      chunk.hash                                                               },
+            { "seq_id",    chunk.seq_id                                                             },
+            { "start_pos", chunk.start_pos                                                          },
+            { "end_pos",   chunk.end_pos                                                            },
+            { "size",      chunk.tokens.size()                                                      },
+            { "status",    chunk.status == llama_chunk_status::LOADED ? "loaded" :
+                        chunk.status == llama_chunk_status::SAVED  ? "saved" :
+                                                                     "empty" },
+            { "metadata",  chunk.metadata                                                           }
         };
 
         if (!chunk.save_file.empty()) {
@@ -240,31 +242,31 @@ private:
         }
 
         if (!chunk.content.empty() && chunk.content.length() <= 100) {
-            result["content_preview"] = chunk.content.substr(0, 100) +
-                                      (chunk.content.length() > 100 ? "..." : "");
+            result["content_preview"] = chunk.content.substr(0, 100) + (chunk.content.length() > 100 ? "..." : "");
         }
 
         // Convert timestamps to ISO 8601 format
         auto time_to_string = [](const auto & tp) {
-            auto time_t = std::chrono::system_clock::to_time_t(tp);
+            auto              time_t = std::chrono::system_clock::to_time_t(tp);
             std::stringstream ss;
             ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
             return ss.str();
         };
 
-        result["created_at"] = time_to_string(chunk.created_at);
+        result["created_at"]    = time_to_string(chunk.created_at);
         result["last_accessed"] = time_to_string(chunk.last_accessed);
 
         return result;
     }
 
-public:
-    explicit llama_kv_cache_manager_impl(llama_context * ctx, const std::string & storage_path)
-        : ctx(ctx), storage(storage_path) {
-        model = &ctx->get_model();
-        vocab = llama_model_get_vocab(model);
-        memory = ctx->get_memory();
-        n_ctx = ctx->n_ctx();
+  public:
+    explicit llama_kv_cache_manager_impl(llama_context * ctx, const std::string & storage_path) :
+        ctx(ctx),
+        storage(storage_path) {
+        model      = &ctx->get_model();
+        vocab      = llama_model_get_vocab(model);
+        memory     = ctx->get_memory();
+        n_ctx      = ctx->n_ctx();
         start_time = std::chrono::high_resolution_clock::now();
     }
 
@@ -282,9 +284,7 @@ public:
         }
 
         // Tokenize content
-        llama_tokens tokens = opts.tokenize ?
-                             tokenize_content(content, true) :
-                             opts.tokens;
+        llama_tokens tokens = opts.tokenize ? tokenize_content(content, true) : opts.tokens;
 
         // Allocate sequence ID (shared sequence 0)
         llama_seq_id seq_id = allocate_seq_id();
@@ -299,15 +299,15 @@ public:
 
         // Create chunk info
         llama_chunk_info chunk;
-        chunk.hash = hash;
-        chunk.content = content;
-        chunk.tokens = tokens;
-        chunk.seq_id = seq_id;
-        chunk.start_pos = start_pos;
-        chunk.end_pos = start_pos + tokens.size();
-        chunk.status = llama_chunk_status::LOADED;
-        chunk.metadata = opts.metadata;
-        chunk.created_at = std::chrono::system_clock::now();
+        chunk.hash          = hash;
+        chunk.content       = content;
+        chunk.tokens        = tokens;
+        chunk.seq_id        = seq_id;
+        chunk.start_pos     = start_pos;
+        chunk.end_pos       = start_pos + tokens.size();
+        chunk.status        = llama_chunk_status::LOADED;
+        chunk.metadata      = opts.metadata;
+        chunk.created_at    = std::chrono::system_clock::now();
         chunk.last_accessed = chunk.created_at;
 
         // Store in KV cache
@@ -338,7 +338,7 @@ public:
         }
 
         // Update status and remove from active memory
-        it->second.status = llama_chunk_status::SAVED;
+        it->second.status    = llama_chunk_status::SAVED;
         it->second.save_file = storage.get_chunk_path(hash);
 
         // Remove tokens from the shared sequence
@@ -361,7 +361,7 @@ public:
 
         // Allocate new sequence ID (shared sequence 0)
         llama_seq_id seq_id = allocate_seq_id();
-        it->second.seq_id = seq_id;
+        it->second.seq_id   = seq_id;
 
         // Restore using proper KV cache state APIs
         if (!storage.restore_chunk_state(hash, it->second, ctx)) {
@@ -370,7 +370,7 @@ public:
         }
 
         // Update status
-        it->second.status = llama_chunk_status::LOADED;
+        it->second.status        = llama_chunk_status::LOADED;
         it->second.last_accessed = std::chrono::system_clock::now();
         it->second.save_file.clear();
 
@@ -425,7 +425,7 @@ public:
 
             for (const auto & [hash, chunk] : chunks) {
                 if (chunk.status == llama_chunk_status::LOADED) {
-                    access_times.push_back({chunk.last_accessed, hash});
+                    access_times.push_back({ chunk.last_accessed, hash });
                 }
             }
 
@@ -443,22 +443,23 @@ public:
 
         llama_pos used_context = llama_memory_seq_pos_max(memory, 0);
         if (used_context >= 0) {
-            used_context += 1; // positions are 0-based
+            used_context += 1;  // positions are 0-based
         } else {
             used_context = 0;
         }
 
-        auto now = std::chrono::high_resolution_clock::now();
+        auto now    = std::chrono::high_resolution_clock::now();
         auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
 
         json result = {
-            {"total_context", n_ctx},
-            {"used_context", used_context},
-            {"free_context", n_ctx - used_context},
-            {"total_chunks", total_chunks.load()},
-            {"loaded_chunks", loaded_chunks.load()},
-            {"saved_chunks", saved_chunks.load()},
-            {"uptime_seconds", uptime}
+            { "total_context",  n_ctx                },
+            { "used_context",   used_context         },
+            { "free_context",   n_ctx - used_context },
+            { "total_chunks",   total_chunks.load()  },
+            { "loaded_chunks",  loaded_chunks.load() },
+            { "saved_chunks",   saved_chunks.load()  },
+            { "uptime_seconds", uptime               },
+            { "fragmentation",  0.0f                 }
         };
 
         // Add chunk list
@@ -467,6 +468,22 @@ public:
             chunks_array.push_back(chunk_to_json(chunk));
         }
         result["chunks"] = chunks_array;
+
+        // Placeholder gap information - not yet tracked
+        result["gaps"] = json::array();
+
+        // Build content index mapping hash -> metadata
+        json index = json::object();
+        for (const auto & [hash, chunk] : chunks) {
+            index[hash] = {
+                { "tokens",   chunk.tokens.size()                                                           },
+                { "status",   chunk.status == llama_chunk_status::LOADED ? "loaded" :
+                            chunk.status == llama_chunk_status::SAVED  ? "saved" :
+                                                                         "empty" },
+                { "metadata", chunk.metadata                                                                }
+            };
+        }
+        result["content_index"] = index;
 
         return result;
     }
@@ -514,7 +531,7 @@ public:
             // Check status criteria
             if (criteria.contains("status")) {
                 std::string required_status = criteria["status"];
-                std::string chunk_status = chunk.status == llama_chunk_status::LOADED ? "loaded" : "saved";
+                std::string chunk_status    = chunk.status == llama_chunk_status::LOADED ? "loaded" : "saved";
                 if (chunk_status != required_status) {
                     matches = false;
                 }
@@ -530,17 +547,17 @@ public:
 
     json batch_operations(const json & request_body) {
         std::unique_lock lock(manager_mutex);
-        json results = json::array();
+        json             results = json::array();
 
         const json & operations = request_body["operations"];
         for (const auto & op : operations) {
             std::string action = op["action"];
-            std::string hash = op.value("hash", "");
+            std::string hash   = op.value("hash", "");
 
             json result = {
-                {"action", action},
-                {"hash", hash},
-                {"success", false}
+                { "action",  action },
+                { "hash",    hash   },
+                { "success", false  }
             };
 
             if (action == "save") {
@@ -563,17 +580,11 @@ public:
     }
 
     // Configuration setters
-    void set_fragmentation_threshold(float threshold) {
-        fragmentation_threshold = threshold;
-    }
+    void set_fragmentation_threshold(float threshold) { fragmentation_threshold = threshold; }
 
-    void set_auto_compact_enabled(bool enabled) {
-        auto_compact_enabled = enabled;
-    }
+    void set_auto_compact_enabled(bool enabled) { auto_compact_enabled = enabled; }
 
-    void set_max_memory_chunks(size_t max_chunks) {
-        max_memory_chunks = max_chunks;
-    }
+    void set_max_memory_chunks(size_t max_chunks) { max_memory_chunks = max_chunks; }
 };
 
 //
@@ -582,14 +593,15 @@ public:
 
 json llama_chunk_info::to_json() const {
     json result = {
-        {"hash", hash},
-        {"seq_id", seq_id},
-        {"start_pos", start_pos},
-        {"end_pos", end_pos},
-        {"size", tokens.size()},
-        {"status", status == llama_chunk_status::LOADED ? "loaded" :
-                  status == llama_chunk_status::SAVED ? "saved" : "empty"},
-        {"metadata", metadata}
+        { "hash",      hash                                                           },
+        { "seq_id",    seq_id                                                         },
+        { "start_pos", start_pos                                                      },
+        { "end_pos",   end_pos                                                        },
+        { "size",      tokens.size()                                                  },
+        { "status",    status == llama_chunk_status::LOADED ? "loaded" :
+                    status == llama_chunk_status::SAVED  ? "saved" :
+                                                           "empty" },
+        { "metadata",  metadata                                                       }
     };
 
     if (!save_file.empty()) {
@@ -597,26 +609,24 @@ json llama_chunk_info::to_json() const {
     }
 
     if (!content.empty() && content.length() <= 100) {
-        result["content_preview"] = content.substr(0, 100) +
-                                  (content.length() > 100 ? "..." : "");
+        result["content_preview"] = content.substr(0, 100) + (content.length() > 100 ? "..." : "");
     }
 
     auto time_to_string = [](const auto & tp) {
-        auto time_t = std::chrono::system_clock::to_time_t(tp);
+        auto              time_t = std::chrono::system_clock::to_time_t(tp);
         std::stringstream ss;
         ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
         return ss.str();
     };
 
-    result["created_at"] = time_to_string(created_at);
+    result["created_at"]    = time_to_string(created_at);
     result["last_accessed"] = time_to_string(last_accessed);
 
     return result;
 }
 
-llama_kv_cache_manager::llama_kv_cache_manager(llama_context * ctx, const std::string & storage_path)
-    : impl(std::make_unique<llama_kv_cache_manager_impl>(ctx, storage_path)) {
-}
+llama_kv_cache_manager::llama_kv_cache_manager(llama_context * ctx, const std::string & storage_path) :
+    impl(std::make_unique<llama_kv_cache_manager_impl>(ctx, storage_path)) {}
 
 llama_kv_cache_manager::~llama_kv_cache_manager() = default;
 
@@ -682,10 +692,12 @@ void llama_kv_cache_manager::set_max_memory_chunks(size_t max_chunks) {
 
 std::string llama_content_addressing::compute_hash(const std::string & content) {
     unsigned char hash[EVP_MAX_MD_SIZE];
-    unsigned int hash_len;
+    unsigned int  hash_len;
 
     EVP_MD_CTX * mdctx = EVP_MD_CTX_new();
-    if (!mdctx) return "";
+    if (!mdctx) {
+        return "";
+    }
 
     if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1) {
         EVP_MD_CTX_free(mdctx);
@@ -707,7 +719,7 @@ std::string llama_content_addressing::compute_hash(const std::string & content) 
     // Convert to hex string
     std::stringstream ss;
     for (unsigned int i = 0; i < hash_len; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int) hash[i];
     }
     return ss.str();
 }
@@ -717,7 +729,5 @@ std::string llama_content_addressing::generate_filename(const std::string & hash
 }
 
 bool llama_content_addressing::validate_hash(const std::string & hash) {
-    return hash.length() == 64 &&
-           std::all_of(hash.begin(), hash.end(),
-                      [](char c) { return std::isxdigit(c); });
+    return hash.length() == 64 && std::all_of(hash.begin(), hash.end(), [](char c) { return std::isxdigit(c); });
 }
