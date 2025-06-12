@@ -441,11 +441,11 @@ public:
     json get_context_info() const {
         std::shared_lock lock(manager_mutex);
 
-        size_t used_context = 0;
-        for (const auto & [hash, chunk] : chunks) {
-            if (chunk.status == llama_chunk_status::LOADED) {
-                used_context += chunk.tokens.size();
-            }
+        llama_pos used_context = llama_memory_seq_pos_max(memory, 0);
+        if (used_context >= 0) {
+            used_context += 1; // positions are 0-based
+        } else {
+            used_context = 0;
         }
 
         auto now = std::chrono::high_resolution_clock::now();
