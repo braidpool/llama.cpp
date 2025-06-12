@@ -182,13 +182,13 @@ private:
         std::vector<llama_token> tokens;
         int n_tokens = llama_tokenize(vocab, content.c_str(), content.length(), nullptr, 0, add_special, false);
         if (n_tokens < 0) {
-            return {};
+            n_tokens = -n_tokens;
         }
 
         tokens.resize(n_tokens);
         int actual_tokens = llama_tokenize(vocab, content.c_str(), content.length(), tokens.data(), n_tokens, add_special, false);
         if (actual_tokens < 0) {
-            return {};
+            actual_tokens = -actual_tokens;
         }
 
         tokens.resize(actual_tokens);
