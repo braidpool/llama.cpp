@@ -150,8 +150,9 @@ class ContextBenchmark:
                 })
                 data = response.json()
                 chunk_hashes.append(data["hash"])
-                total_tokens += data["size"]
-                print(f"   Added chunk {i+1}: {data['size']} tokens ({data['hash'][:12]}...)")
+                token_size = data.get("token_size", data.get("size", 0))
+                total_tokens += token_size
+                print(f"   Added chunk {i+1}: {token_size} tokens ({data['hash'][:12]}...)")
             except Exception as e:
                 print(f"   Context full at chunk {i+1} - reached capacity limit")
                 print(f"   Successfully added {len(chunk_hashes)} chunks with {total_tokens} tokens")
@@ -180,7 +181,14 @@ class ContextBenchmark:
         print("-" * 42)
         
         if len(chunk_hashes) < 3:
-            raise ValueError("Need at least 3 chunks for replacement benchmark")
+            print("❌ Benchmark skipped: Need at least 3 chunks for replacement benchmark")
+            return BenchmarkResult(
+                operation="chunk_replacement_cached",
+                duration=0.0,
+                tokens_processed=0,
+                throughput=0.0,
+                additional_info={"error": "insufficient_chunks"},
+            )
         
         # Get initial performance metrics
         initial_metrics = self._get_performance_metrics()
@@ -220,7 +228,7 @@ class ContextBenchmark:
         # Get final performance metrics
         final_metrics = self._get_performance_metrics()
         
-        tokens_processed = new_chunk_data["size"]
+        tokens_processed = new_chunk_data.get("token_size", new_chunk_data.get("size", 0))
         throughput = tokens_processed / duration if duration > 0 else 0
         
         print(f"✅ Replaced chunk {target_index} with KV cache")
@@ -266,7 +274,8 @@ class ContextBenchmark:
                     "content": content,
                     "metadata": {"type": "recontextualized", "index": i}
                 })
-                total_tokens += response.json()["size"]
+                chunk_data = response.json()
+                total_tokens += chunk_data.get("token_size", chunk_data.get("size", 0))
                 chunks_added += 1
             except Exception as e:
                 print(f"   Context full at chunk {i+1} during recontextualization")
@@ -310,7 +319,11 @@ class ContextBenchmark:
         # Get chunk info for token count
         response = self._make_request("GET", self.context_url)
         data = response.json()
-        saved_tokens = sum(chunk["size"] for chunk in data["chunks"] if chunk["hash"] in test_hashes)
+        saved_tokens = sum(
+            chunk.get("token_size", chunk.get("size", 0))
+            for chunk in data["chunks"]
+            if chunk["hash"] in test_hashes
+        )
         
         # Benchmark restore operations
         print(f"Restoring {len(test_hashes)} chunks...")
