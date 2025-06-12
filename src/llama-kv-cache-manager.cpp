@@ -546,8 +546,7 @@ class llama_kv_cache_manager_impl {
     }
 
     json batch_operations(const json & request_body) {
-        std::unique_lock lock(manager_mutex);
-        json             results = json::array();
+        json results = json::array();
 
         const json & operations = request_body["operations"];
         for (const auto & op : operations) {
