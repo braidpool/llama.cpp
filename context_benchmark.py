@@ -251,51 +251,63 @@ class ContextBenchmark:
         )
     
     def benchmark_full_recontextualization(self) -> BenchmarkResult:
-        """Benchmark clearing entire context and re-adding all chunks (traditional approach)"""
-        print("\n🔥 Benchmark: Full Re-contextualization (Traditional)")
-        print("-" * 52)
+        """Benchmark using chat completions with all chunks concatenated (traditional approach)"""
+        print("\n🔥 Benchmark: Full Re-contextualization (Traditional Chat API)")
+        print("-" * 62)
         
         # Prepare modified chunk list (simulate the replacement with small content)
         modified_chunks = self.test_chunks.copy()
         target_index = len(modified_chunks) // 2
         modified_chunks[target_index] = "REPLACEMENT: Updated configuration with new settings and optimized parameters."
         
+        # Concatenate all chunks into a single context message
+        full_context = "\n\n".join([f"=== Chunk {i+1} ===\n{content}" for i, content in enumerate(modified_chunks)])
+        
         start_time = time.time()
         
-        # Clear entire context
-        self.clear_context()
-        
-        # Re-add all chunks with error handling
-        total_tokens = 0
-        chunks_added = 0
-        for i, content in enumerate(modified_chunks):
-            try:
-                response = self._make_request("POST", self.context_url, json={
-                    "content": content,
-                    "metadata": {"type": "recontextualized", "index": i}
-                })
-                chunk_data = response.json()
-                total_tokens += chunk_data.get("token_size", chunk_data.get("size", 0))
-                chunks_added += 1
-            except Exception as e:
-                print(f"   Context full at chunk {i+1} during recontextualization")
-                break
+        # Make a chat completion request with the full context as a system message
+        try:
+            response = self._make_request("POST", self.chat_url, json={
+                "model": "gpt-3.5-turbo",  # Model name doesn't matter for llama.cpp
+                "messages": [
+                    {"role": "system", "content": full_context},
+                    {"role": "user", "content": self.query_prompt}
+                ],
+                "max_tokens": 50,
+                "temperature": 0.1
+            })
+            
+            response_data = response.json()
+            
+            # Estimate tokens from the concatenated context
+            # This is a rough estimate - actual tokenization may vary
+            total_tokens = len(full_context.split()) * 1.3  # Rough token estimate
+            
+        except Exception as e:
+            print(f"   Chat completion failed: {e}")
+            print(f"   Context may be too large for single request")
+            total_tokens = 0
         
         end_time = time.time()
         duration = end_time - start_time
         throughput = total_tokens / duration if duration > 0 else 0
         
-        print(f"✅ Re-contextualized {chunks_added} chunks")
-        print(f"   Total tokens: {total_tokens}")
+        print(f"✅ Re-contextualized using chat completions")
+        print(f"   Context size: {len(full_context)} characters")
+        print(f"   Estimated tokens: {int(total_tokens)}")
         print(f"   Duration: {duration:.3f}s")
         print(f"   Throughput: {throughput:.1f} tokens/second")
         
         return BenchmarkResult(
             operation="full_recontextualization",
             duration=duration,
-            tokens_processed=total_tokens,
+            tokens_processed=int(total_tokens),
             throughput=throughput,
-            additional_info={"chunks_processed": chunks_added}
+            additional_info={
+                "chunks_processed": len(modified_chunks),
+                "context_chars": len(full_context),
+                "method": "chat_completions"
+            }
         )
     
     def benchmark_save_restore_operations(self, chunk_hashes: List[str]) -> Tuple[BenchmarkResult, BenchmarkResult]:

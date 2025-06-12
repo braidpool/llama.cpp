@@ -4216,6 +4216,33 @@ int main(int argc, char ** argv) {
         }
     };
 
+    const auto handle_context_get_chunk = [&ctx_server, &res_ok, &res_error](const httplib::Request &, httplib::Response & res, const std::string & hash) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        if (!llama_content_addressing::validate_hash(hash)) {
+            res_error(res, format_error_response("Invalid hash format", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Get chunk info first to check if chunk exists
+        json chunk_info = ctx_server.chunk_manager->get_chunk_info(hash);
+        if (chunk_info.is_null()) {
+            res_error(res, format_error_response("Chunk not found", ERROR_TYPE_NOT_FOUND));
+            return;
+        }
+
+        // Get the content
+        std::string content = ctx_server.chunk_manager->get_chunk_content(hash);
+        
+        // Add content to the chunk info
+        chunk_info["content"] = content;
+        
+        res_ok(res, chunk_info);
+    };
+
     const auto handle_context_batch = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
         if (!ctx_server.chunk_manager) {
             res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
@@ -5013,6 +5040,7 @@ int main(int argc, char ** argv) {
     svr->Post("/slots/:id_slot",      handle_slots_action);
     // Context management
     svr->Get ("/context",             handle_context_get);
+    svr->Get ("/context/:hash",       [&](const httplib::Request & req, httplib::Response & res) { handle_context_get_chunk(req, res, req.path_params.at("hash")); });
     svr->Post("/context",             handle_context_post);
     svr->Post("/context/batch",       handle_context_batch);
     svr->Post("/context/compact",     handle_context_compact);
