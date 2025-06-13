@@ -215,13 +215,13 @@ class LlamaContextManager:
                 position_start = chunk_data["position"]["start"]
                 position_end = chunk_data["position"]["end"]
             else:
-                position_start = chunk_data["start_pos"]
-                position_end = chunk_data["end_pos"]
+                position_start = chunk_data["token_start_pos"]
+                position_end = chunk_data["token_end_pos"]
                 
             self._chunk_cache[chunk_hash] = ChunkInfo(
                 hash=chunk_data["hash"],
                 content="",  # Content not included in context info
-                size=chunk_data["size"],
+                size=chunk_data.get("token_size", chunk_data.get("size")),
                 status=chunk_data["status"],
                 position_start=position_start,
                 position_end=position_end,
@@ -247,13 +247,13 @@ class LlamaContextManager:
                     position_start = chunk_data["position"]["start"]
                     position_end = chunk_data["position"]["end"]
                 else:
-                    position_start = chunk_data["start_pos"]
-                    position_end = chunk_data["end_pos"]
+                    position_start = chunk_data["token_start_pos"]
+                    position_end = chunk_data["token_end_pos"]
                     
                 chunk_info = ChunkInfo(
                     hash=chunk_data["hash"],
                     content="",
-                    size=chunk_data["size"],
+                    size=chunk_data.get("token_size", chunk_data.get("size")),
                     status=chunk_data["status"],
                     position_start=position_start,
                     position_end=position_end,

@@ -2718,6 +2718,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
     add_opt(common_arg(
+        {"--context-manager"},
+        "use context manager instead of slot-based isolation (default: disabled)",
+        [](common_params & params) {
+            params.context_manager = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--port"}, "PORT",
         string_format("port to listen (default: %d)", params.port),
         [](common_params & params, int value) {

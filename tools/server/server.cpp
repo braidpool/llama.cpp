@@ -1915,6 +1915,13 @@ struct server_context {
 
         params_base = params;
 
+        // In context manager mode, automatically set batch size to context size
+        // to allow loading chunks up to the full context size
+        if (params_base.context_manager && params_base.n_batch < params_base.n_ctx) {
+            SRV_INF("context manager mode: automatically setting n_batch = n_ctx (%d)\n", params_base.n_ctx);
+            params_base.n_batch = params_base.n_ctx;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model = llama_init.model.get();
@@ -2181,6 +2188,15 @@ struct server_context {
         slot.task_type     = task.type;
         slot.params        = std::move(task.params);
         slot.prompt_tokens = std::move(task.prompt_tokens);
+        
+        // In context manager mode, start slot after loaded context chunks
+        if (params_base.context_manager && chunk_manager) {
+            llama_pos max_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+            if (max_pos >= 0) {
+                slot.n_past = max_pos + 1;
+                SLT_INF(slot, "context manager mode: starting slot at position %d", slot.n_past);
+            }
+        }
 
         if (!are_lora_equal(slot.params.lora, slot.lora)) {
             // if lora is changed, we cannot reuse cached tokens
@@ -3041,7 +3057,7 @@ struct server_context {
 
             slot.i_batch = batch.n_tokens;
 
-            common_batch_add(batch, slot.sampled, slot.n_past, { slot.id }, true);
+            common_batch_add(batch, slot.sampled, slot.n_past, { params_base.context_manager ? 0 : slot.id }, true);
 
             slot.n_past += 1;
             slot.cache_tokens.push_back(slot.sampled);
@@ -3075,11 +3091,33 @@ struct server_context {
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
-                        slot.n_past = 0;
+                        // In context manager mode, initialize slot to match pre-loaded context
+                        if (params_base.context_manager && chunk_manager) {
+                            llama_pos context_end = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                            if (context_end >= 0) {
+                                // Set n_past to the end of pre-loaded context
+                                slot.n_past = context_end + 1;
+                                
+                                // Initialize cache_tokens to match context state
+                                // We need this for proper prefix matching and cache operations
+                                slot.cache_tokens.clear();
+                                for (int i = 0; i < slot.n_past; i++) {
+                                    slot.cache_tokens.push_back(0); // Use dummy tokens since we don't have the actual ones
+                                }
+                                
+                                SLT_INF(slot, "context manager: initialized slot with pre-loaded context, n_past = %d\n", slot.n_past);
+                            } else {
+                                slot.n_past = 0;
+                            }
+                        } else {
+                            slot.n_past = 0;
+                        }
+                        
                         slot.n_prompt_tokens = prompt_tokens.size();
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
+                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d, n_past = %d\n", 
+                                slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens, slot.n_past);
 
                         // print prompt tokens (for debugging)
                         /*if (1) {
@@ -3096,12 +3134,46 @@ struct server_context {
 
                         // empty prompt passed -> release the slot and send empty response
                         if (prompt_tokens.empty()) {
-                            SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
+                            // In context manager mode with loaded context, allow empty prompts
+                            if (params_base.context_manager && chunk_manager && llama_memory_seq_pos_max(llama_get_memory(ctx), 0) >= 0) {
+                                llama_pos context_end = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                                SLT_INF(slot, "empty prompt with context manager - evaluating continuation from position %d", context_end);
+                                
+                                // We need to evaluate one token to get logits for generation
+                                // Add a newline token as a natural continuation
+                                std::vector<llama_token> nl_tokens = common_tokenize(ctx, "\n", false);
+                                llama_token nl_token = nl_tokens.empty() ? 0 : nl_tokens[0];
+                                
+                                // Add directly to batch for immediate evaluation
+                                slot.i_batch = batch.n_tokens;
+                                common_batch_add(batch, nl_token, context_end, { 0 }, false);
+                                
+                                // Request logits for this position
+                                batch.logits[batch.n_tokens - 1] = true;
+                                
+                                // Update slot state to skip normal prompt processing
+                                slot.n_past = context_end + 1;
+                                slot.n_prompt_tokens = 0;  // No prompt tokens to process
+                                slot.n_prompt_tokens_processed = 0;
+                                slot.n_decoded = 0;
+                                slot.t_start_generation = ggml_time_us();
+                                
+                                // Add the token to cache_tokens
+                                slot.cache_tokens.push_back(nl_token);
+                                
+                                // Mark as ready for generation after decode
+                                slot.state = SLOT_STATE_DONE_PROMPT;
+                                
+                                // Continue to next slot
+                                continue;
+                            } else {
+                                SLT_WRN(slot, "%s", "empty prompt - releasing slot");
 
-                            slot.release();
-                            slot.print_timings();
-                            send_final_response(slot);
-                            continue;
+                                slot.release();
+                                slot.print_timings();
+                                send_final_response(slot);
+                                continue;
+                            }
                         }
 
                         if (slot.is_non_causal()) {
@@ -3166,7 +3238,10 @@ struct server_context {
 
                             if (slot.params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
-                                slot.n_past = slot.cache_tokens.get_common_prefix(prompt_tokens);
+                                // In context manager mode, preserve n_past if we have pre-loaded context
+                                if (!params_base.context_manager || slot.n_past == 0) {
+                                    slot.n_past = slot.cache_tokens.get_common_prefix(prompt_tokens);
+                                }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (params_base.n_cache_reuse > 0) {
@@ -3198,9 +3273,10 @@ struct server_context {
                                             //}
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                            const llama_seq_id seq_id = params_base.context_manager ? 0 : slot.id;
 
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
-                                            llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
+                                            llama_memory_seq_rm (llama_get_memory(ctx), seq_id, head_p, head_c);
+                                            llama_memory_seq_add(llama_get_memory(ctx), seq_id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.cache_tokens.set_token(head_p + i, slot.cache_tokens[head_c + i]);
@@ -3218,19 +3294,23 @@ struct server_context {
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove the entire KV cache
-                                slot.n_past = 0;
+                                // In context manager mode with pre-loaded context, preserve n_past
+                                if (!params_base.context_manager || slot.n_past == 0) {
+                                    slot.n_past = 0;
+                                }
                             }
 
                             if (slot.n_past > 0 && slot.n_past < (int) slot.cache_tokens.size()) {
-                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                                const llama_seq_id seq_id = params_base.context_manager ? 0 : slot.id;
+                                const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), seq_id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, cache_tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int) slot.cache_tokens.size(), slot.id, pos_min);
+                                    SLT_ERR(slot, "n_past = %d, cache_tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int) slot.cache_tokens.size(), seq_id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
                                 const auto n_swa = llama_model_n_swa(model);
                                 if (pos_min > slot.n_past - n_swa) {
-                                    SLT_WRN(slot, "n_past = %d, cache_tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", slot.n_past, (int) slot.cache_tokens.size(), slot.id, pos_min, n_swa);
+                                    SLT_WRN(slot, "n_past = %d, cache_tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", slot.n_past, (int) slot.cache_tokens.size(), seq_id, pos_min, n_swa);
                                     SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA, see %s)\n",
                                             "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                     slot.n_past = 0;
@@ -3257,15 +3337,23 @@ struct server_context {
                     }
 
                     // keep only the common part
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.n_past, -1)) {
-                        // could not partially delete (likely using a non-Transformer model)
-                        llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
+                    const llama_seq_id seq_id = params_base.context_manager ? 0 : slot.id;
+                    
+                    // In context manager mode, only clear cache after the pre-loaded context
+                    if (params_base.context_manager && chunk_manager && slot.n_past > 0) {
+                        // Keep the pre-loaded context, only remove anything after n_past
+                        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, slot.n_past, -1);
+                        SLT_INF(slot, "context manager: keeping pre-loaded context, kv cache rm [%d, end) for seq_id = %d\n", slot.n_past, seq_id);
+                    } else {
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, slot.n_past, -1)) {
+                            // could not partially delete (likely using a non-Transformer model)
+                            llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
 
-                        // there is no common part left
-                        slot.n_past = 0;
+                            // there is no common part left
+                            slot.n_past = 0;
+                        }
+                        SLT_INF(slot, "kv cache rm [%d, end) for seq_id = %d\n", slot.n_past, seq_id);
                     }
-
-                    SLT_INF(slot, "kv cache rm [%d, end)\n", slot.n_past);
 
                     // remove the non-common part from the cache
                     slot.cache_tokens.keep_first(slot.n_past);
@@ -3275,7 +3363,7 @@ struct server_context {
                             && slot.prompt_tokens[slot.n_past] == LLAMA_TOKEN_NULL) {
                         // process the image
                         int32_t new_n_past;
-                        int32_t res = slot.prompt_tokens.process_chunk(ctx, mctx, slot.n_past, slot.id, new_n_past);
+                        int32_t res = slot.prompt_tokens.process_chunk(ctx, mctx, slot.n_past, params_base.context_manager ? 0 : slot.id, new_n_past);
                         int32_t n_pos = new_n_past - slot.n_past;
 
                         if (res != 0) {
@@ -3296,9 +3384,12 @@ struct server_context {
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.n_past < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
+                    // In context manager mode, we need to process new prompt tokens starting from position 0
+                    int prompt_pos = slot.n_prompt_tokens_processed;
+                    
+                    while (prompt_pos < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
                         // get next token to process
-                        llama_token cur_tok = slot.prompt_tokens[slot.n_past];
+                        llama_token cur_tok = slot.prompt_tokens[prompt_pos];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
                         }
@@ -3306,11 +3397,12 @@ struct server_context {
                         // without pooling, we want to output the embeddings for all the tokens in the batch
                         const bool need_embd = slot.task_type == SERVER_TASK_TYPE_EMBEDDING && llama_pooling_type(slot.ctx) == LLAMA_POOLING_TYPE_NONE;
 
-                        common_batch_add(batch, cur_tok, slot.n_past, { slot.id }, need_embd);
+                        common_batch_add(batch, cur_tok, slot.n_past, { params_base.context_manager ? 0 : slot.id }, need_embd);
                         slot.cache_tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
                         slot.n_past++;
+                        prompt_pos++;
                     }
 
                     // SLT_INF(slot, "new cache_tokens: %s\n", slot.cache_tokens.str().c_str());
@@ -3318,7 +3410,7 @@ struct server_context {
                     SLT_INF(slot, "prompt processing progress, n_past = %d, n_tokens = %d, progress = %f\n", slot.n_past, batch.n_tokens, (float) slot.n_prompt_tokens_processed / slot.n_prompt_tokens);
 
                     // entire prompt has been processed
-                    if (slot.n_past == slot.n_prompt_tokens) {
+                    if (slot.n_prompt_tokens_processed == slot.n_prompt_tokens) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.n_tokens > 0);
@@ -3577,10 +3669,10 @@ struct server_context {
 
                 // construct the speculation batch
                 common_batch_clear(slot.batch_spec);
-                common_batch_add  (slot.batch_spec, id, slot.n_past, { slot.id }, true);
+                common_batch_add  (slot.batch_spec, id, slot.n_past, { params_base.context_manager ? 0 : slot.id }, true);
 
                 for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(slot.batch_spec, draft[i], slot.n_past + 1 + i, { slot.id }, true);
+                    common_batch_add(slot.batch_spec, draft[i], slot.n_past + 1 + i, { params_base.context_manager ? 0 : slot.id }, true);
                 }
 
                 SLT_DBG(slot, "decoding speculative batch, size = %d\n", slot.batch_spec.n_tokens);
@@ -3599,7 +3691,7 @@ struct server_context {
                 slot.cache_tokens.push_back(id);
                 slot.cache_tokens.insert({ids.begin(), ids.end() - 1});
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.n_past, -1);
+                llama_memory_seq_rm(llama_get_memory(ctx), params_base.context_manager ? 0 : slot.id, slot.n_past, -1);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
@@ -4168,11 +4260,9 @@ int main(int argc, char ** argv) {
             // Format response to match API specification
             json response = {
                 {"hash", hash},
-                {"size", chunk_info["size"]},
-                {"position", {
-                    {"start", chunk_info["start_pos"]},
-                    {"end", chunk_info["end_pos"]}
-                }},
+                {"token_size", chunk_info["token_size"]},
+                {"memory_size", chunk_info["memory_size"]},
+                {"position", chunk_info["position"]},
                 {"status", chunk_info["status"]},
                 {"deduplication", false}
             };
@@ -4203,8 +4293,14 @@ int main(int argc, char ** argv) {
             success = ctx_server.chunk_manager->restore_chunk(hash);
         } else if (action == "erase") {
             success = ctx_server.chunk_manager->erase_chunk(hash);
+        } else if (action == "activate") {
+            success = ctx_server.chunk_manager->activate_chunk(hash);
+        } else if (action == "deactivate") {
+            success = ctx_server.chunk_manager->deactivate_chunk(hash);
+        } else if (action == "unload") {
+            success = ctx_server.chunk_manager->unload_chunk(hash);
         } else {
-            res_error(res, format_error_response("Invalid action. Must be: save, restore, or erase", ERROR_TYPE_INVALID_REQUEST));
+            res_error(res, format_error_response("Invalid action. Must be: save, restore, erase, activate, deactivate, or unload", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
 
@@ -4213,6 +4309,33 @@ int main(int argc, char ** argv) {
         } else {
             res_error(res, format_error_response("Action failed", ERROR_TYPE_SERVER));
         }
+    };
+
+    const auto handle_context_get_chunk = [&ctx_server, &res_ok, &res_error](const httplib::Request &, httplib::Response & res, const std::string & hash) {
+        if (!ctx_server.chunk_manager) {
+            res_error(res, format_error_response("Context management not initialized", ERROR_TYPE_UNAVAILABLE));
+            return;
+        }
+
+        if (!llama_content_addressing::validate_hash(hash)) {
+            res_error(res, format_error_response("Invalid hash format", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Get chunk info first to check if chunk exists
+        json chunk_info = ctx_server.chunk_manager->get_chunk_info(hash);
+        if (chunk_info.is_null()) {
+            res_error(res, format_error_response("Chunk not found", ERROR_TYPE_NOT_FOUND));
+            return;
+        }
+
+        // Get the content
+        std::string content = ctx_server.chunk_manager->get_chunk_content(hash);
+        
+        // Add content to the chunk info
+        chunk_info["content"] = content;
+        
+        res_ok(res, chunk_info);
     };
 
     const auto handle_context_batch = [&ctx_server, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
@@ -5012,6 +5135,7 @@ int main(int argc, char ** argv) {
     svr->Post("/slots/:id_slot",      handle_slots_action);
     // Context management
     svr->Get ("/context",             handle_context_get);
+    svr->Get ("/context/:hash",       [&](const httplib::Request & req, httplib::Response & res) { handle_context_get_chunk(req, res, req.path_params.at("hash")); });
     svr->Post("/context",             handle_context_post);
     svr->Post("/context/batch",       handle_context_batch);
     svr->Post("/context/compact",     handle_context_compact);
@@ -5067,6 +5191,10 @@ int main(int argc, char ** argv) {
     svr->wait_until_ready();
 
     LOG_INF("%s: HTTP server is listening, hostname: %s, port: %d, http threads: %d\n", __func__, params.hostname.c_str(), params.port, params.n_threads_http);
+    
+    if (params.context_manager) {
+        LOG_INF("%s: context manager mode enabled - all operations will use sequence 0\n", __func__);
+    }
 
     // load the model
     LOG_INF("%s: loading model\n", __func__);
