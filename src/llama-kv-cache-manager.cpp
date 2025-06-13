@@ -228,13 +228,17 @@ class llama_kv_cache_manager_impl {
         json result = {
             { "hash",      chunk.hash                                                               },
             { "seq_id",    chunk.seq_id                                                             },
-            { "token_start_pos", chunk.token_start_pos },
-            { "token_end_pos",   chunk.token_end_pos },
+            { "position", {
+                { "start", chunk.token_start_pos },
+                { "end",   chunk.token_end_pos }
+            }},
             { "token_size",      chunk.tokens.size() },
             { "memory_size",     chunk.memory_size      },
-            { "status",    chunk.status == llama_chunk_status::LOADED ? "loaded" :
-                        chunk.status == llama_chunk_status::SAVED  ? "saved" :
-                                                                     "empty" },
+            { "status",    chunk.status == llama_chunk_status::ACTIVE   ? "active" :
+                        chunk.status == llama_chunk_status::INACTIVE ? "inactive" :
+                        chunk.status == llama_chunk_status::SYSTEM   ? "system" :
+                        chunk.status == llama_chunk_status::DISK     ? "disk" :
+                                                                       "empty" },
             { "metadata",  chunk.metadata                                                           }
         };
 
@@ -307,7 +311,7 @@ class llama_kv_cache_manager_impl {
         chunk.token_start_pos = start_pos;
         chunk.token_end_pos   = start_pos + tokens.size();
         chunk.memory_size     = tokens.size();
-        chunk.status        = llama_chunk_status::LOADED;
+        chunk.status        = llama_chunk_status::ACTIVE;
         chunk.metadata      = opts.metadata;
         chunk.created_at    = std::chrono::system_clock::now();
         chunk.last_accessed = chunk.created_at;
@@ -330,7 +334,13 @@ class llama_kv_cache_manager_impl {
         std::unique_lock lock(manager_mutex);
 
         auto it = chunks.find(hash);
-        if (it == chunks.end() || it->second.status != llama_chunk_status::LOADED) {
+        if (it == chunks.end()) {
+            return false;
+        }
+        
+        // Can only save chunks that are in VRAM (active or inactive)
+        if (it->second.status != llama_chunk_status::ACTIVE && 
+            it->second.status != llama_chunk_status::INACTIVE) {
             return false;
         }
 
@@ -340,12 +350,14 @@ class llama_kv_cache_manager_impl {
         }
 
         // Update status and remove from active memory
-        it->second.status    = llama_chunk_status::SAVED;
+        it->second.status    = llama_chunk_status::DISK;
         it->second.save_file = storage.get_chunk_path(hash);
 
         // Remove tokens from the shared sequence
-        memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
-        it->second.seq_id = -1;
+        if (it->second.seq_id >= 0) {
+            memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
+            it->second.seq_id = -1;
+        }
 
         loaded_chunks--;
         saved_chunks++;
@@ -357,41 +369,64 @@ class llama_kv_cache_manager_impl {
         std::unique_lock lock(manager_mutex);
 
         auto it = chunks.find(hash);
-        if (it == chunks.end() || it->second.status != llama_chunk_status::SAVED) {
+        if (it == chunks.end()) {
+            return false;
+        }
+        
+        // Handle different source states
+        if (it->second.status == llama_chunk_status::DISK) {
+            // Restore from disk
+            if (!storage.restore_chunk_state(hash, it->second, ctx)) {
+                return false;
+            }
+        } else if (it->second.status == llama_chunk_status::SYSTEM) {
+            // Restore from system RAM - tokens and content are already in memory
+            // Just need to put back in KV cache
+        } else if (it->second.status == llama_chunk_status::ACTIVE || 
+                   it->second.status == llama_chunk_status::INACTIVE) {
+            // Already in VRAM, just activate it
+            it->second.status = llama_chunk_status::ACTIVE;
+            return true;
+        } else {
             return false;
         }
 
-        // Allocate new sequence ID (shared sequence 0)
-        llama_seq_id seq_id = allocate_seq_id();
-        it->second.seq_id   = seq_id;
+        // Find position to place the chunk
+        llama_pos start_pos = 0;
+        if (it->second.status == llama_chunk_status::DISK || 
+            it->second.status == llama_chunk_status::SYSTEM) {
+            // For disk/system chunks, find the end of current context
+            llama_pos max_pos = llama_memory_seq_pos_max(memory, 0);
+            start_pos = (max_pos >= 0) ? max_pos + 1 : 0;
+        }
+        if (start_pos < 0) {
+            return false;
+        }
 
-        // Restore using proper KV cache state APIs
-        if (!storage.restore_chunk_state(hash, it->second, ctx)) {
+        // Allocate sequence ID (always use 0 for shared context)
+        it->second.seq_id = 0;
+        it->second.token_start_pos = start_pos;
+        it->second.token_end_pos = start_pos + it->second.tokens.size();
+
+        // Restore tokens to KV cache
+        if (!store_tokens_in_sequence(it->second.tokens, it->second.seq_id, start_pos)) {
             it->second.seq_id = -1;
             return false;
         }
-
-        // Determine placement after restore
-        llama_pos start_pos = llama_memory_seq_pos_min(memory, seq_id);
-        if (start_pos < 0) {
-            start_pos = 0;
-        }
-        llama_pos end_pos = llama_memory_seq_pos_max(memory, seq_id);
-        if (end_pos < start_pos) {
-            end_pos = start_pos + it->second.tokens.size();
-        }
-
-        it->second.token_start_pos = start_pos;
-        it->second.token_end_pos   = end_pos + 1;
-        it->second.memory_size     = it->second.token_end_pos - it->second.token_start_pos;
-
-        // Update status
-        it->second.status        = llama_chunk_status::LOADED;
+        // Update status and counters based on previous state
+        auto prev_status = it->second.status;
+        it->second.status = llama_chunk_status::ACTIVE;
         it->second.last_accessed = std::chrono::system_clock::now();
-        it->second.save_file.clear();
-
-        loaded_chunks++;
-        saved_chunks--;
+        
+        if (prev_status == llama_chunk_status::DISK) {
+            it->second.save_file.clear();
+            saved_chunks--;
+            loaded_chunks++;
+        } else if (prev_status == llama_chunk_status::SYSTEM) {
+            // Moving from system RAM back to VRAM
+            it->second.system_cache.clear();
+            loaded_chunks++;
+        }
 
         return true;
     }
@@ -404,11 +439,12 @@ class llama_kv_cache_manager_impl {
             return false;
         }
 
-        // Remove from KV cache if loaded
-        if (it->second.status == llama_chunk_status::LOADED) {
+        // Remove from KV cache if in VRAM
+        if (it->second.status == llama_chunk_status::ACTIVE || 
+            it->second.status == llama_chunk_status::INACTIVE) {
             memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
             loaded_chunks--;
-        } else if (it->second.status == llama_chunk_status::SAVED) {
+        } else if (it->second.status == llama_chunk_status::DISK) {
             saved_chunks--;
         }
 
@@ -440,7 +476,8 @@ class llama_kv_cache_manager_impl {
             std::vector<std::pair<std::chrono::time_point<std::chrono::system_clock>, std::string>> access_times;
 
             for (const auto & [hash, chunk] : chunks) {
-                if (chunk.status == llama_chunk_status::LOADED) {
+                if (chunk.status == llama_chunk_status::ACTIVE || 
+                    chunk.status == llama_chunk_status::INACTIVE) {
                     access_times.push_back({ chunk.last_accessed, hash });
                 }
             }
@@ -492,11 +529,12 @@ class llama_kv_cache_manager_impl {
         json index = json::object();
         for (const auto & [hash, chunk] : chunks) {
             index[hash] = {
-                { "tokens",   chunk.tokens.size()                                                           },
-                { "status",   chunk.status == llama_chunk_status::LOADED ? "loaded" :
-                            chunk.status == llama_chunk_status::SAVED  ? "saved" :
-                                                                         "empty" },
-                { "metadata", chunk.metadata                                                                }
+                { "tokens",   chunk.tokens.size() },
+                { "status",   chunk.status == llama_chunk_status::ACTIVE   ? "active" :
+                            chunk.status == llama_chunk_status::INACTIVE ? "inactive" :
+                            chunk.status == llama_chunk_status::SYSTEM   ? "system" :
+                            chunk.status == llama_chunk_status::DISK     ? "disk" : "empty" },
+                { "metadata", chunk.metadata }
             };
         }
         result["content_index"] = index;
@@ -547,7 +585,10 @@ class llama_kv_cache_manager_impl {
             // Check status criteria
             if (criteria.contains("status")) {
                 std::string required_status = criteria["status"];
-                std::string chunk_status    = chunk.status == llama_chunk_status::LOADED ? "loaded" : "saved";
+                std::string chunk_status = chunk.status == llama_chunk_status::ACTIVE   ? "active" :
+                                          chunk.status == llama_chunk_status::INACTIVE ? "inactive" :
+                                          chunk.status == llama_chunk_status::SYSTEM   ? "system" :
+                                          chunk.status == llama_chunk_status::DISK     ? "disk" : "unknown";
                 if (chunk_status != required_status) {
                     matches = false;
                 }
@@ -559,6 +600,87 @@ class llama_kv_cache_manager_impl {
         }
 
         return results;
+    }
+
+    bool activate_chunk(const std::string & hash) {
+        std::unique_lock lock(manager_mutex);
+        
+        auto it = chunks.find(hash);
+        if (it == chunks.end()) {
+            return false;
+        }
+        
+        // Can only activate chunks that are inactive in VRAM
+        if (it->second.status != llama_chunk_status::INACTIVE) {
+            return false;
+        }
+        
+        it->second.status = llama_chunk_status::ACTIVE;
+        it->second.last_accessed = std::chrono::system_clock::now();
+        return true;
+    }
+    
+    bool deactivate_chunk(const std::string & hash) {
+        std::unique_lock lock(manager_mutex);
+        
+        auto it = chunks.find(hash);
+        if (it == chunks.end()) {
+            return false;
+        }
+        
+        // Can only deactivate chunks that are active in VRAM
+        if (it->second.status != llama_chunk_status::ACTIVE) {
+            return false;
+        }
+        
+        it->second.status = llama_chunk_status::INACTIVE;
+        it->second.last_accessed = std::chrono::system_clock::now();
+        return true;
+    }
+    
+    bool unload_chunk(const std::string & hash) {
+        std::unique_lock lock(manager_mutex);
+        
+        auto it = chunks.find(hash);
+        if (it == chunks.end()) {
+            return false;
+        }
+        
+        // Can only unload chunks that are in VRAM (active or inactive)
+        if (it->second.status != llama_chunk_status::ACTIVE && 
+            it->second.status != llama_chunk_status::INACTIVE) {
+            return false;
+        }
+        
+        // Save KV cache state to system memory
+        size_t state_size = ctx->state_seq_get_size(it->second.seq_id);
+        if (state_size == 0) {
+            return false;
+        }
+        
+        it->second.system_cache.resize(state_size);
+        size_t actual_size = ctx->state_seq_get_data(
+            it->second.seq_id, 
+            it->second.system_cache.data(), 
+            state_size
+        );
+        
+        if (actual_size != state_size) {
+            it->second.system_cache.clear();
+            return false;
+        }
+        
+        // Remove from KV cache
+        if (it->second.seq_id >= 0) {
+            memory->seq_rm(it->second.seq_id, it->second.token_start_pos, it->second.token_end_pos);
+            it->second.seq_id = -1;
+        }
+        
+        it->second.status = llama_chunk_status::SYSTEM;
+        it->second.last_accessed = std::chrono::system_clock::now();
+        loaded_chunks--;
+        
+        return true;
     }
 
     json batch_operations(const json & request_body) {
@@ -581,6 +703,12 @@ class llama_kv_cache_manager_impl {
                 result["success"] = restore_chunk(hash);
             } else if (action == "erase") {
                 result["success"] = erase_chunk(hash);
+            } else if (action == "activate") {
+                result["success"] = activate_chunk(hash);
+            } else if (action == "deactivate") {
+                result["success"] = deactivate_chunk(hash);
+            } else if (action == "unload") {
+                result["success"] = unload_chunk(hash);
             }
 
             results.push_back(result);
@@ -608,16 +736,19 @@ class llama_kv_cache_manager_impl {
 
 json llama_chunk_info::to_json() const {
     json result = {
-        { "hash",      hash                                                           },
-        { "seq_id",    seq_id                                                         },
-        { "token_start_pos", token_start_pos },
-        { "token_end_pos",   token_end_pos },
-        { "token_size",      tokens.size() },
-        { "memory_size",     memory_size },
-        { "status",    status == llama_chunk_status::LOADED ? "loaded" :
-                    status == llama_chunk_status::SAVED  ? "saved" :
-                                                           "empty" },
-        { "metadata",  metadata                                                       }
+        { "hash",      hash },
+        { "seq_id",    seq_id },
+        { "position", {
+            { "start", token_start_pos },
+            { "end",   token_end_pos }
+        }},
+        { "token_size",  tokens.size() },
+        { "memory_size", memory_size },
+        { "status",  status == llama_chunk_status::ACTIVE   ? "active" :
+                    status == llama_chunk_status::INACTIVE ? "inactive" :
+                    status == llama_chunk_status::SYSTEM   ? "system" :
+                    status == llama_chunk_status::DISK     ? "disk" : "empty" },
+        { "metadata", metadata }
     };
 
     if (!save_file.empty()) {
@@ -660,6 +791,18 @@ bool llama_kv_cache_manager::restore_chunk(const std::string & hash) {
 
 bool llama_kv_cache_manager::erase_chunk(const std::string & hash) {
     return impl->erase_chunk(hash);
+}
+
+bool llama_kv_cache_manager::activate_chunk(const std::string & hash) {
+    return impl->activate_chunk(hash);
+}
+
+bool llama_kv_cache_manager::deactivate_chunk(const std::string & hash) {
+    return impl->deactivate_chunk(hash);
+}
+
+bool llama_kv_cache_manager::unload_chunk(const std::string & hash) {
+    return impl->unload_chunk(hash);
 }
 
 json llama_kv_cache_manager::batch_operations(const json & request_body) {

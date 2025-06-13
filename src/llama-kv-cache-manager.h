@@ -28,9 +28,11 @@ using llama_tokens = std::vector<llama_token>;
 //
 
 enum class llama_chunk_status {
-    LOADED,
-    SAVED,
-    EMPTY
+    ACTIVE,    // In VRAM and will be used for next prompt
+    INACTIVE,  // In VRAM but excluded from next prompt
+    SYSTEM,    // Offloaded to system RAM
+    DISK,      // Saved to disk
+    EMPTY      // Placeholder/deleted state
 };
 
 enum class llama_position_strategy {
@@ -62,6 +64,7 @@ struct llama_chunk_info {
     size_t memory_size = 0;             // Actual KV cache memory used
     llama_chunk_status status = llama_chunk_status::EMPTY;
     std::string save_file;             // Disk file path
+    std::vector<uint8_t> system_cache; // System RAM cache for KV data
     json metadata;                     // User metadata
     std::chrono::time_point<std::chrono::system_clock> created_at;
     std::chrono::time_point<std::chrono::system_clock> last_accessed;
@@ -82,6 +85,11 @@ public:
     bool save_chunk(const std::string & hash);
     bool restore_chunk(const std::string & hash);
     bool erase_chunk(const std::string & hash);
+    
+    // State management
+    bool activate_chunk(const std::string & hash);
+    bool deactivate_chunk(const std::string & hash);
+    bool unload_chunk(const std::string & hash);  // Move to system RAM
 
     // Batch operations
     json batch_operations(const json & request_body);
