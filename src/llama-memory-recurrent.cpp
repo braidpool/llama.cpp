@@ -362,6 +362,11 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+size_t llama_memory_recurrent::get_memory_size() const {
+    // For recurrent models, return 0 or a simple estimate
+    return 0;  // TODO: implement proper memory size calculation for recurrent cache
+}
+
 llama_memory_state_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     std::vector<llama_ubatch> ubatches;
 

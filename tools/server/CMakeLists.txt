@@ -35,11 +35,15 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_include_directories(${TARGET} PRIVATE ../llava)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PRIVATE common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(${TARGET} PRIVATE llama common mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+# Link OpenSSL for SHA256 hashing in context manager
+find_package(OpenSSL REQUIRED)
+target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
 
 if (LLAMA_SERVER_SSL)
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(${TARGET} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(${TARGET} PRIVATE OpenSSL::SSL)
     target_compile_definitions(${TARGET} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 endif()
 
@@ -47,4 +51,3 @@ if (WIN32)
     TARGET_LINK_LIBRARIES(${TARGET} PRIVATE ws2_32)
 endif()
 
-target_compile_features(${TARGET} PRIVATE cxx_std_17)

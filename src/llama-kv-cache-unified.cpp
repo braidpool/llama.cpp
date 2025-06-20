@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-cache-manager.h"
 
 #include <algorithm>
 #include <cassert>
@@ -708,6 +709,24 @@ bool llama_kv_cache_unified::get_has_shift() const {
     return cells.get_has_shift();
 }
 
+std::pair<ggml_type, ggml_type> llama_kv_cache_unified::get_kv_types() const {
+    if (layers.empty()) {
+        return {GGML_TYPE_F16, GGML_TYPE_F16};  // Default fallback if no layers
+    }
+
+    // Get types from the first layer's tensors
+    const auto& first_layer = layers[0];
+    return {first_layer.k->type, first_layer.v->type};
+}
+
+llama_kv_cells_unified & llama_kv_cache_unified::get_cells() {
+    return cells;
+}
+
+const llama_kv_cells_unified & llama_kv_cache_unified::get_cells() const {
+    return cells;
+}
+
 uint32_t llama_kv_cache_unified::get_n_kv() const {
     return std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad)));
 }
@@ -896,6 +915,10 @@ size_t llama_kv_cache_unified::total_size() const {
     }
 
     return size;
+}
+
+size_t llama_kv_cache_unified::get_memory_size() const {
+    return total_size();
 }
 
 size_t llama_kv_cache_unified::size_k_bytes() const {

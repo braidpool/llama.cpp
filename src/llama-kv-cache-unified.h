@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class llama_kv_cache_manager;
 
 //
 // llama_kv_cache_unified
@@ -78,6 +79,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    size_t get_memory_size() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1) const override;
@@ -90,6 +93,13 @@ public:
     uint32_t get_size() const;
 
     bool get_has_shift() const;
+
+    // get the KV cache tensor types
+    std::pair<ggml_type, ggml_type> get_kv_types() const;
+    
+    // get access to the cells for sequence management
+    llama_kv_cells_unified & get_cells();
+    const llama_kv_cells_unified & get_cells() const;
 
     //
     // graph_build API

@@ -23,6 +23,8 @@ class llama_kv_cache_unified_state;
 class llama_kv_cache_unified_iswa_state;
 class llama_memory_recurrent_state;
 class llama_memory_hybrid_state;
+class llama_kv_cache_recurrent_state;
+class llama_kv_cache_manager;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {

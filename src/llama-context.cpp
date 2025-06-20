@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-unified.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -48,6 +49,7 @@ llama_context::llama_context(
     cparams.warmup           = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    cparams.n_kv_max         = params.n_kv_max;  // Will be auto-sized later if 0
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -186,6 +188,90 @@ llama_context::llama_context(
         }
     }
 
+    // Auto-size n_kv_max based on available VRAM if not specified (before memory creation)
+    LLAMA_LOG_INFO("%s: auto-sizing check: vocab_only=%d, n_kv_max=%u\n", __func__, hparams.vocab_only, cparams.n_kv_max);
+    if (!hparams.vocab_only && cparams.n_kv_max == 0) {
+        size_t free_memory = 0, total_memory = 0;
+        
+        // Get VRAM from GPU backend (use model.backends which are already initialized)
+        for (auto & backend : backends) {
+            auto * dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_dev_memory(dev, &free_memory, &total_memory);
+                LLAMA_LOG_INFO("%s: GPU memory: %.2f GB free, %.2f GB total\n", __func__, 
+                               free_memory / 1024.0 / 1024.0 / 1024.0,
+                               total_memory / 1024.0 / 1024.0 / 1024.0);
+                break;  // Use first GPU
+            }
+        }
+        
+        if (free_memory > 0) {
+            // Reserve memory for model inference, compute buffers, and other operations: 20% or 2GB, whichever is larger
+            // This accounts for matrix multiplication buffers, type conversions, pool overhead, and attention computation
+            size_t reserve = std::max(static_cast<size_t>(free_memory * 0.2), static_cast<size_t>(2ULL * 1024 * 1024 * 1024));
+            size_t available = free_memory > reserve ? free_memory - reserve : 0;
+            
+            // Calculate tokens that fit in available memory
+            size_t bytes_per_token = 0;
+            const uint32_t n_layer = hparams.n_layer;
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa();
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa();
+            
+            // K and V embeddings per token across all layers
+            // Each layer stores [n_embd_k_gqa, kv_size] for K and [n_embd_v_gqa, kv_size] for V
+            // For quantized types, ggml_type_size returns block size, but we need per-element size
+            size_t k_elements_per_block = ggml_blck_size(params.type_k);
+            size_t v_elements_per_block = ggml_blck_size(params.type_v);
+            size_t k_size_per_token = n_embd_k_gqa * ggml_type_size(params.type_k) / k_elements_per_block;
+            size_t v_size_per_token = n_embd_v_gqa * ggml_type_size(params.type_v) / v_elements_per_block;
+            bytes_per_token = (k_size_per_token + v_size_per_token) * n_layer;
+            
+            LLAMA_LOG_INFO("%s: KV cache: %zu bytes per token (K: %zu, V: %zu per token * %u layers)\n", __func__, 
+                           bytes_per_token, k_size_per_token, v_size_per_token, n_layer);
+            LLAMA_LOG_INFO("%s: Available for KV cache: %.2f GB (reserved %.2f GB)\n", __func__,
+                           available / 1024.0 / 1024.0 / 1024.0,
+                           reserve / 1024.0 / 1024.0 / 1024.0);
+            
+            if (bytes_per_token > 0 && available > 0) {
+                size_t max_tokens = available / bytes_per_token;
+                
+                // Use as much VRAM as possible (like --kv-size -1 behavior)
+                uint32_t raw_kv_max = std::max(cparams.n_ctx, static_cast<uint32_t>(max_tokens));
+                
+                // Align to padding requirements (needed for flash attention)
+                uint32_t padding = llama_kv_cache_unified::get_padding(cparams);
+                cparams.n_kv_max = (raw_kv_max / padding) * padding;
+                
+                LLAMA_LOG_INFO("%s: auto-sized KV cache to %u tokens (%.2f GB, aligned to %u), raw: %u\n", __func__, 
+                               cparams.n_kv_max, 
+                               (cparams.n_kv_max * bytes_per_token) / 1024.0 / 1024.0 / 1024.0,
+                               padding, raw_kv_max);
+            } else {
+                cparams.n_kv_max = cparams.n_ctx;  // Fallback
+                LLAMA_LOG_WARN("%s: insufficient memory for auto-sizing, using n_kv_max = n_ctx\n", __func__);
+            }
+        } else {
+            cparams.n_kv_max = cparams.n_ctx;  // Fallback if no GPU memory info
+            LLAMA_LOG_WARN("%s: could not query GPU memory, using n_kv_max = n_ctx\n", __func__);
+        }
+    } 
+    
+    // Validate n_kv_max
+    if (cparams.n_kv_max < cparams.n_ctx) {
+        LLAMA_LOG_WARN("%s: n_kv_max (%u) < n_ctx (%u), setting n_kv_max = n_ctx\n", 
+                       __func__, cparams.n_kv_max, cparams.n_ctx);
+        cparams.n_kv_max = cparams.n_ctx;
+    }
+    
+    // Ensure n_kv_max is aligned to padding requirements (critical for flash attention)
+    const uint32_t padding = llama_kv_cache_unified::get_padding(cparams);
+    if (cparams.n_kv_max % padding != 0) {
+        uint32_t old_n_kv_max = cparams.n_kv_max;
+        cparams.n_kv_max = (cparams.n_kv_max / padding) * padding;
+        LLAMA_LOG_WARN("%s: n_kv_max (%u) not aligned to padding (%u), adjusted to %u\n", 
+                       __func__, old_n_kv_max, padding, cparams.n_kv_max);
+    }
+
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
@@ -194,6 +280,7 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
+        LLAMA_LOG_INFO("%s: creating KV cache with n_kv_max = %u tokens\n", __func__, cparams.n_kv_max);
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
@@ -422,6 +509,11 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+void llama_context::set_memory(std::unique_ptr<llama_memory_i> custom_memory) {
+    LLAMA_LOG_DEBUG("%s: replacing memory implementation\n", __func__);
+    memory = std::move(custom_memory);
 }
 
 // deprecated
@@ -2160,6 +2252,7 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_kv_max                    =*/ 0,    // 0 = auto-size to VRAM
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
@@ -2188,6 +2281,7 @@ llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
+        /*.context_manager             =*/ false,
     };
 
     return result;

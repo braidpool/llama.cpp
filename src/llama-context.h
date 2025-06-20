@@ -19,6 +19,7 @@ class llama_io_write_i;
 
 struct llama_memory_i;
 struct llama_memory_state_i;
+class llama_kv_cache_manager;
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -47,6 +48,7 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+    void set_memory(std::unique_ptr<llama_memory_i> custom_memory);
 
     // return true of the KV cache was updated
     // TODO: remove
@@ -232,6 +234,9 @@ private:
 
     // TODO: temporary, until the llama_kv_self_defrag() API is removed
     bool memory_force_optimize = false;
+    
+    // chunk manager for context management (optional)
+    llama_kv_cache_manager * chunk_manager = nullptr;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     size_t  logits_size = 0; // capacity (of floats) for logits

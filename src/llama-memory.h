@@ -101,6 +101,12 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     //
+    // memory size queries
+    //
+    
+    virtual size_t get_memory_size() const = 0;
+
+    //
     // state write/read
     //
 

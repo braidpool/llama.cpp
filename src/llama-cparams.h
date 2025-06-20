@@ -8,6 +8,7 @@
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
+    uint32_t n_kv_max;        // maximum KV cache size (can be > n_ctx)
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

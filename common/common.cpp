@@ -1132,6 +1132,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
+    cparams.n_kv_max          = params.n_kv_max;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
@@ -1157,6 +1158,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
+    cparams.context_manager   = params.context_manager;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

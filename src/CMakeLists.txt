@@ -20,6 +20,7 @@ add_library(llama
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
+            llama-kv-cache-manager.cpp
             llama-kv-cache-unified.cpp
             llama-kv-cache-unified-iswa.cpp
             llama-memory.cpp
@@ -38,10 +39,14 @@ add_library(llama
             )
 
 target_include_directories(llama PRIVATE .)
-target_include_directories(llama PUBLIC ../include)
+target_include_directories(llama PUBLIC ../include ../vendor)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# Link OpenSSL for SHA256 hashing in KV cache manager
+find_package(OpenSSL REQUIRED)
+target_link_libraries(llama PRIVATE OpenSSL::Crypto)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
