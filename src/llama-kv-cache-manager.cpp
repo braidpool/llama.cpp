@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cassert>
+#include <map>
 
 //
 // llama_chunk_info
@@ -291,6 +292,17 @@ llama_chunk_result llama_kv_cache_manager::add_chunk_with_result(const std::stri
     if (opts.metadata.contains("kv_cache_end_pos")) {
         chunk.kv_end_pos = opts.metadata["kv_cache_end_pos"];
     }
+    
+    // For user inputs, calculate positions if not provided
+    if (!is_inference_output && chunk.kv_start_pos < 0) {
+        // Get the starting position we used
+        llama_pos start_pos = seq_pos_max(ACTIVE_SEQ_ID) + 1 - tokens.size();
+        if (start_pos < 0) start_pos = 0;
+        chunk.kv_start_pos = start_pos;
+        chunk.kv_end_pos = start_pos + tokens.size() - 1;
+        LLAMA_LOG_INFO("%s: set chunk positions [%d, %d] for user input\n", 
+                       __func__, chunk.kv_start_pos, chunk.kv_end_pos);
+    }
 
     chunks[hash] = std::move(chunk);
 
@@ -346,13 +358,20 @@ bool llama_kv_cache_manager::activate_chunk(const std::string & hash) {
     }
 
     if (chunk.status == llama_chunk_status::INACTIVE) {
-        // Move from inactive to active sequence
-        unified_cache->seq_cp(INACTIVE_SEQ_ID, ACTIVE_SEQ_ID, -1, -1);
-        unified_cache->seq_rm(INACTIVE_SEQ_ID, -1, -1);
+        // Validate position info
+        if (chunk.kv_start_pos < 0 || chunk.kv_end_pos < 0) {
+            LLAMA_LOG_ERROR("%s: chunk %s has invalid position info\n", __func__, hash.substr(0, 8).c_str());
+            return false;
+        }
+        
+        // Move specific positions from inactive to active sequence
+        unified_cache->seq_cp(INACTIVE_SEQ_ID, ACTIVE_SEQ_ID, chunk.kv_start_pos, chunk.kv_end_pos + 1);
+        unified_cache->seq_rm(INACTIVE_SEQ_ID, chunk.kv_start_pos, chunk.kv_end_pos + 1);
         chunk.seq_id = ACTIVE_SEQ_ID;
         chunk.status = llama_chunk_status::ACTIVE;
 
-        LLAMA_LOG_INFO("%s: activated chunk %s\n", __func__, hash.substr(0, 8).c_str());
+        LLAMA_LOG_INFO("%s: activated chunk %s at positions [%d, %d]\n", 
+                       __func__, hash.substr(0, 8).c_str(), chunk.kv_start_pos, chunk.kv_end_pos);
         return true;
     }
 
@@ -381,13 +400,20 @@ bool llama_kv_cache_manager::deactivate_chunk(const std::string & hash) {
     }
 
     if (chunk.status == llama_chunk_status::ACTIVE) {
-        // Move from active to inactive sequence
-        unified_cache->seq_cp(ACTIVE_SEQ_ID, INACTIVE_SEQ_ID, -1, -1);
-        unified_cache->seq_rm(ACTIVE_SEQ_ID, -1, -1);
+        // Validate position info
+        if (chunk.kv_start_pos < 0 || chunk.kv_end_pos < 0) {
+            LLAMA_LOG_ERROR("%s: chunk %s has invalid position info\n", __func__, hash.substr(0, 8).c_str());
+            return false;
+        }
+        
+        // Move specific positions from active to inactive sequence
+        unified_cache->seq_cp(ACTIVE_SEQ_ID, INACTIVE_SEQ_ID, chunk.kv_start_pos, chunk.kv_end_pos + 1);
+        unified_cache->seq_rm(ACTIVE_SEQ_ID, chunk.kv_start_pos, chunk.kv_end_pos + 1);
         chunk.seq_id = INACTIVE_SEQ_ID;
         chunk.status = llama_chunk_status::INACTIVE;
 
-        LLAMA_LOG_INFO("%s: deactivated chunk %s\n", __func__, hash.substr(0, 8).c_str());
+        LLAMA_LOG_INFO("%s: deactivated chunk %s at positions [%d, %d]\n", 
+                       __func__, hash.substr(0, 8).c_str(), chunk.kv_start_pos, chunk.kv_end_pos);
         return true;
     }
 
@@ -640,15 +666,39 @@ void llama_kv_cache_manager::audit_kv_cache_state() const {
 
     std::shared_lock lock(chunks_mutex);
     LLAMA_LOG_INFO("Tracked chunks: %zu\n", chunks.size());
+    
+    // Track positions by sequence
+    std::map<llama_seq_id, std::vector<std::pair<llama_pos, llama_pos>>> seq_positions;
 
     for (const auto & [hash, chunk] : chunks) {
-        LLAMA_LOG_INFO("  Chunk %s: status=%s, tokens=%zu, seq_id=%d\n",
+        LLAMA_LOG_INFO("  Chunk %s: status=%s, tokens=%zu, seq_id=%d, pos=[%d,%d], type=%s\n",
                       hash.substr(0, 8).c_str(),
                       chunk.status == llama_chunk_status::ACTIVE ? "active" :
                       chunk.status == llama_chunk_status::INACTIVE ? "inactive" :
                       chunk.status == llama_chunk_status::SYSTEM ? "system" : "empty",
                       chunk.tokens.size(),
-                      chunk.seq_id);
+                      chunk.seq_id,
+                      chunk.kv_start_pos,
+                      chunk.kv_end_pos,
+                      chunk.metadata.contains("type") ? 
+                          std::string(chunk.metadata["type"]).c_str() :
+                          (chunk.metadata.contains("source") ? 
+                              std::string(chunk.metadata["source"]).c_str() : "unknown"));
+                      
+        // Track position ranges by sequence
+        if (chunk.seq_id >= 0 && chunk.kv_start_pos >= 0) {
+            seq_positions[chunk.seq_id].push_back({chunk.kv_start_pos, chunk.kv_end_pos});
+        }
+    }
+    
+    // Show position coverage by sequence
+    LLAMA_LOG_INFO("\nPosition coverage by sequence:\n");
+    for (const auto & [seq_id, positions] : seq_positions) {
+        LLAMA_LOG_INFO("  Seq %d:", seq_id);
+        for (const auto & [start, end] : positions) {
+            LLAMA_LOG_INFO(" [%d-%d]", start, end);
+        }
+        LLAMA_LOG_INFO("\n");
     }
 
     LLAMA_LOG_INFO("===================\n");
